@@ -5,6 +5,7 @@ import scipy.constants as sc
 import astropy.constants as const
 import astropy.units as u
 import cmasher as cmr
+import cv2
 
 default_cmap = cmr.arctic
 
@@ -104,6 +105,36 @@ def Wm2_to_Tb(nuFnu, nu, pixelscale):
 
     return Tb
 
+def Wm2_to_ph(nuFnu, nu, surface, exp_time, pixelscale):
+    '''
+    Converts flux from W.m-2.px-1 to a number of photons
+    Flux [W.m-2/pixel]
+    nu [Hz]
+    surface [m]
+    exp_time [s]
+    pixelscale [arcsec]
+    '''
+    pixel_area = (pixelscale*arcsec)**2  #pixelscale**2 #(pixelscale*arcsec)**2    #check pixel units
+    E = sc.h*nu
+
+    #return( nuFnu*exp_time*surface*pixel_area / E )
+    return( nuFnu*exp_time*surface*pixel_area/ E )
+
+
+def ph_to_Wm2(N_ph, nu, surface, exp_time, pixelscale):
+    '''
+    Converts from a number of photons to W.m-2.px-1
+    nu [Hz]
+    surface [m]
+    exp_time [s]
+    pixelscale [arcsec]
+    '''
+    pixel_area = (pixelscale*arcsec)**2 #pixelscale**2 #(pixelscale*arcsec)**2    #check pixel units
+    E = sc.h*nu
+
+    return( N_ph * E / (exp_time*surface*pixel_area) )
+    #return( N_ph * E / (exp_time*surface) )
+
 
 # -- Functions to deal the synthesized beam.
 def _beam_area(self):
@@ -136,7 +167,7 @@ def make_cut(im, x0,y0,x1,y1,num=None,plot=False):
     if plot:
         vmax = np.max(im)
         vmin = vmax * 1e-6
-        norm = mcolors.LogNorm(vmin=vmin, vmax=vmax, clip=True)
+        norm = colors.LogNorm(vmin=vmin, vmax=vmax, clip=True)
         plt.imshow(im,origin="lower", norm=norm)
         plt.plot([x0,x1],[y0,y1])
 
@@ -149,7 +180,7 @@ def make_cut(im, x0,y0,x1,y1,num=None,plot=False):
         # Extract the values along the line at the pixel spacing
         length = int(np.hypot(x1-x0, y1-y0))
         x, y = np.linspace(x0, x1, length), np.linspace(y0, y1, length)
-        zi = im[y.astype(int), x.astype(int)]
+        zi = im[y.astype(np.int), x.astype(np.int)]
 
     return zi
 
@@ -401,33 +432,175 @@ def add_colorbar(mappable, shift=None, width=0.05, ax=None, trim_left=0, trim_ri
         cax.xaxis.set_ticks_position('top')
         return fig.colorbar(mappable, cax=cax, orientation="vertical",**kwargs)
 
-def get_planet_r_az(disk_PA, inc, planet_r, planet_PA):
-    # For a given disk PA and inc, and planet PA, and projected separation
-    # gives the az to be passed to the planet_az option and the deprojected separation
-    # input :
-    # disk_PA, inc and  planet_PA in degrees
-    # planet_r radius in arcsec or au
-    # output :
-    #  r in same unit as planet_r
-    # planet_az in degrees (is value to be passed to mcfost)
 
-    # test.get_planet_rPA does the opposite from a mcfost image
+def ref_flux(wavelength):
+    '''
+    Returns the reference flux in W.m-2 to calculate a magnitude in the Johnson system.
 
-    dPA = planet_PA - disk_PA
-    az = np.arctan(np.tan(np.deg2rad(dPA)) / np.cos(np.deg2rad(inc)))
-    az = - np.rad2deg(az) # conversion to deg and correct convention for mcfost
+    wavelength : float
+        Wavelength in µm
+
+    pixel_scale : float
+        Pixel scale in arcsec
+
+    '''
+
+    #filters taken from ESO Skycalc,  [name, wavelength in nm, flux in erg.s-1.cm-2.A-1]
+    filters = [
+    ['U', 	365, 4.18023e-09],
+    ['B',	440, 6.60085e-09],
+    ['V',	550, 3.60994e-09],
+    ['R',	650, 2.28665e-09],
+    ['I',   800, 1.22603e-09],
+    ['Z',	900, 7.76068e-10],
+    ['Y',	1025, 5.973e-10],
+    ['J',	1220, 3.12e-10],
+    ['H', 	1630, 1.14e-10],
+    ['K', 	2190,  3.94e-11],
+    ['L', 	3450, 4.83e-12],
+    ['M', 	4750, 2.04e-12],
+    ['N', 	10200, 1.23e-13],
+    ['Q', 	21000, 6.8e-15]
+    ]
+    for i in range(len(filters)):                  #flux conversion in W.m-2
+        filters[i][2] = 1e-3 * filters[i][1]*10 * filters[i][2]
+
+    #looking for the right filter
+    ind_filt = 0
+    min_ = filters[0][1]
+    for i in range(len(filters)):
+        delta = np.abs(wavelength-filters[i][1]/1000)
+        if delta < min_ :
+            min_ = delta
+            ind_filt = i
+
+    #corresponding flux and intensity
+    F0 = filters[ind_filt][2]
+
+    print('band',filters[ind_filt][0])
+
+    return F0
 
 
-    y_p = planet_r * np.sin(np.deg2rad(dPA))
-    x_p = planet_r * np.cos(np.deg2rad(dPA))
+def para_angle(nb_im, exp_time, lat, dec):
+    '''
+    Returns a list of the parallactic angles realizations of the system
 
-    x = x_p
-    y = y_p / np.cos(np.deg2rad(inc))
 
-    r = np.hypot(x,y)
 
-    # test :
-    #mcfost.get_planet_r_az(62.5,50.2, 0.60521173 * 157.2, 11.619613647460938)
-    # should give : (130.00000395126042, 62.500002877567475)
+    '''
 
-    return r, az
+    #conversion
+    lat = lat*np.pi/180
+    dec = dec*np.pi/180
+
+    #hour angle in rad
+    ha_min = (-nb_im/2 * exp_time) /240 * np.pi/180
+    ha_max = (nb_im/2 * exp_time) /240 * np.pi/180
+    ha = np.linspace(ha_min, ha_max, nb_im)
+
+    #parallactic angle
+    pa = []
+    for ind in range(nb_im):
+        #tan_q = np.sin(ha[ind]) / (np.cos(dec)*np.tan(lat) - np.sin(dec)*np.cos(ha[ind]))
+        #q = np.arctan(tan_q)
+        num_tanq = np.sin(ha[ind])
+        denum_tanq = np.cos(dec)*np.tan(lat) - np.sin(dec)*np.cos(ha[ind])
+
+        q = np.arctan2(denum_tanq, num_tanq)   #why is it working ?
+        q = q * 180/np.pi
+
+        #q in [-pi; pi]
+        if q > 90 :
+            q -= 180
+
+        pa.append(q)
+
+    return(pa)
+
+
+
+def prepare_PSF(PSF, FoV_PSF, image, crop=True, crop_factor=1, norm_method='sum', norm_factor=1):
+    '''
+    Resize, normalize and crop the given PSF sequence to the same pixelscale and size of the given image object
+    
+    FoV_PSF in ", can be a list-like if rectangular FoV
+    
+    norm_method : sum or max
+    
+    crop_factor : length of the original image / length of the cropped image side
+    
+    '''
+    
+    try :
+        FoV_x = FoV_PSF[0]
+        FoV_y = FoV_PSF[1]
+    except TypeError :
+        FoV_x, FoV_y = FoV_PSF, FoV_PSF
+        
+    #PSF dimensions
+    PSF = np.array(PSF)  #convert PSF into a np array to get the shape attribute
+    PSF_list = (len(PSF.shape) == 3)  #checking if a PSF list or a unique PSF is given
+    nx_psf, ny_psf = PSF.shape[-2], PSF.shape[-1]
+    
+    print('Old PSF dimensions : ('+str(nx_psf)+', '+str(ny_psf)+')')
+    
+    #New PSF dimensions
+    new_nx_psf = FoV_x / image.pixelscale
+    new_ny_psf = FoV_y / image.pixelscale
+    
+    print('New PSF dimensions : ('+str(new_nx_psf)+', '+str(new_ny_psf)+')')
+    
+    #Resizing
+    print('Resizing PSF ...')
+    scale = 1e40  #used to avoid approximation errors
+    if PSF_list :
+        for ind_psf in range(len(PSF)):
+            PSF[ind_psf] = cv2.resize(PSF[ind_psf]*scale, [new_nx_psf, new_ny_psf], interpolation=cv2.INTER_LINEAR)
+    else :
+        PSF = cv2.resize(PSF*scale, [new_nx_psf, new_ny_psf], interpolation=cv2.INTER_LINEAR) /scale
+    
+    #Normalizing
+    Print('Normalizing by '+norm_method)
+    if norm_method == 'sum' :
+        n_method = np.sum
+    elif norm_method == 'max' :
+        n_method = np.max
+        
+    if PSF_list :
+        for ind_psf in range(len(PSF)):
+            PSF[ind_psf] /= n_method(PSF[ind_psf])
+            PSF[ind_psf] *= norm_factor
+    else :
+        PSF /= n_method(PSF)
+        PSF *= norm_factor
+
+            
+    #Cropping
+    if crop :
+        print('Cropping PSF ...')
+        
+        #get PSF center with max(PSF)
+        new_cx_psf, new_cy_psf = np.unravel_index(PSF.argmax(), PSF.shape)[-2], np.unravel_index(PSF.argmax(), PSF.shape)[-1]
+        print('PSF max is found in coordinate :', np.unravel_index(PSF.argmax(), PSF.shape))
+        
+        #adjust crop_factor
+        crop_factor = 1/crop_factor *0.5
+        
+        #Centering
+        x_min = new_cx_psf -  crop_factor* image.cx
+        x_max = new_cx_psf +  crop_factor* (image.nx-image.cx)
+        y_min = new_cy_psf -  crop_factor* image.cy
+        y_max = new_cy_psf +  crop_factor* (image.ny-image.cy)
+        
+        #Slicing
+        if PSF_list :
+            for ind_psf in range(len(PSF)):
+                PSF[ind_psf] = PSF[ind_psf, x_min:x_max, y_min:y_max]
+        else :
+            PSF = PSF[x_min:x_max, y_min:y_max]
+    
+        print('New PSF dimensions after cropping : ('+str(x_max-x_min)+', '+str(y_max-y_min)+')')
+            
+    return(PSF)
+
